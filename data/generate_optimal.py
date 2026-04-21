@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import pickle
 import networkx as nx
 
@@ -37,52 +38,104 @@ def greedy_expert_policy(env):
     except nx.NetworkXNoPath:
         return None
 
-def generate_dataset(num_episodes=500, save_path="data/expert_data.pkl"):
-    """生成极速贪心遍历数据"""
-    print(f" 开始使生成数据集")
-    
-    # 确保 data 目录存在
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
+def _resolve_output_dir(save_path):
+    """兼容旧的 pkl 路径配置，统一改为目录分块存储。"""
+    normalized_path = os.path.normpath(save_path)
+    if normalized_path.endswith(".pkl"):
+        chunk_dir = os.path.splitext(normalized_path)[0]
+        print(f"检测到旧版文件路径 {save_path}，将改为分块目录存储: {chunk_dir}")
+        return chunk_dir
+    return normalized_path
+
+def _flush_chunk(chunk_data, chunk_index, output_dir):
+    chunk_path = os.path.join(output_dir, f"chunk_{chunk_index:05d}.pkl")
+    with open(chunk_path, "wb") as f:
+        pickle.dump(chunk_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return chunk_path
+
+def generate_dataset(num_episodes=500, save_path="data/expert_data", chunk_episode_size=100):
+    """生成极速贪心遍历数据，并按回合分块写入磁盘。"""
+    print("开始生成专家数据集")
+
+    output_dir = _resolve_output_dir(save_path)
+    os.makedirs(output_dir, exist_ok=True)
+
     # 初始化环境
     env = SatelliteEnv(num_planes=6, sats_per_plane=10, failure_prob=0.0, max_link_distance=10000e3)
-    dataset = []
+    current_chunk = []
+    chunk_files = []
+    chunk_sizes = []
     successful_episodes = 0
-    
+    total_samples = 0
+    chunk_index = 0
+
     while successful_episodes < num_episodes:
         state = env.reset()
         episode_data = []
         done = False
-        max_steps = env.num_satellites * 3 
+        max_steps = env.num_satellites * 3
         steps = 0
-        
+
         while not done and steps < max_steps:
             # 调用贪心专家求动作
             action = greedy_expert_policy(env)
             if action is None:
-                break 
-                
+                break
+
             episode_data.append({
                 "state": state,
                 "action": action
             })
-            
+
             state, reward, done, info = env.step(action)
             steps += 1
-            
-        # 如果走完了所有节点，就把这局的数据合并到总数据集中
+
+        # 如果走完了所有节点，就把这局的数据写入当前分块
         if done:
-            dataset.extend(episode_data)
+            current_chunk.extend(episode_data)
             successful_episodes += 1
-            # 进度条打印频率可以调高一点，因为现在非常快
+
+            if successful_episodes % chunk_episode_size == 0:
+                chunk_path = _flush_chunk(current_chunk, chunk_index, output_dir)
+                chunk_files.append(os.path.basename(chunk_path))
+                chunk_sizes.append(len(current_chunk))
+                total_samples += len(current_chunk)
+                print(
+                    f"已写入分块 {chunk_index + 1}: "
+                    f"{successful_episodes}/{num_episodes} 个回合, {len(current_chunk)} 条样本"
+                )
+                current_chunk = []
+                chunk_index += 1
+
             if successful_episodes % 50 == 0:
                 print(f"已完成 {successful_episodes}/{num_episodes} 个回合数据采集...")
 
-    with open(save_path, "wb") as f:
-        pickle.dump(dataset, f)
-        
-    print(f"\n专家数据生成完毕！共收集了 {len(dataset)} 步高阶动作对，已保存至 {save_path}")
+    if current_chunk:
+        chunk_path = _flush_chunk(current_chunk, chunk_index, output_dir)
+        chunk_files.append(os.path.basename(chunk_path))
+        chunk_sizes.append(len(current_chunk))
+        total_samples += len(current_chunk)
+        print(
+            f"已写入最终分块 {chunk_index + 1}: "
+            f"{successful_episodes}/{num_episodes} 个回合, {len(current_chunk)} 条样本"
+        )
+
+    metadata = {
+        "format": "chunked_expert_dataset",
+        "num_episodes": successful_episodes,
+        "total_samples": total_samples,
+        "chunk_episode_size": chunk_episode_size,
+        "chunk_files": chunk_files,
+        "chunk_sizes": chunk_sizes,
+    }
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    print(
+        f"\n专家数据生成完毕！共收集了 {total_samples} 步高阶动作对，"
+        f"已保存至目录 {output_dir}"
+    )
 
 if __name__ == "__main__":
-    # 速度变快了，可以直接生成 500 个回合的数据喂给模型
-    generate_dataset(num_episodes=500)
+    generate_dataset(num_episodes=5000)
