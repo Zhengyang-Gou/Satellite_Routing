@@ -12,7 +12,7 @@ from models.policy_net import PolicyNet
 def run_ai_inference(model_path="models/sl_policy.pth"):
     print("启动推理测试")
 
-    env = SatelliteEnv(num_planes=6, sats_per_plane=10, failure_prob=0.0)
+    env = SatelliteEnv(num_planes=6, sats_per_plane=10, failure_prob=0.1)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     model = PolicyNet(input_dim=4, hidden_dim=64).to(device)
@@ -46,13 +46,13 @@ def run_ai_inference(model_path="models/sl_policy.pth"):
             action = probs.argmax(dim=-1).item()
             confidence = probs[0, action].item() * 100
             
-            print(f" 步骤 {step_count+1:02d}: AI 决定发往卫星 {action:02d} ")
+            print(f" 步骤 {step_count+1:02d}: 发往卫星 {action:02d} ")
 
             state, reward, done, info = env.step(action)
             step_count += 1
             
     if done:
-        print(f"测试成功 完美遍历了全部 {env.num_satellites} 颗卫星")
+        print(f"测试成功 遍历了全部 {env.num_satellites} 颗卫星")
         print(f"消耗总时间/总延迟: {info['total_delay']:.4f} 秒")
         print(f"实际行走步数: {step_count} 步")
     else:
