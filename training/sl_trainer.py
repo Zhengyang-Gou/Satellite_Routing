@@ -11,12 +11,18 @@ sys.path.append(project_root)
 from data.dataset_sl import get_dataloader
 from models.policy_net import PolicyNet
 
+def resolve_project_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.join(project_root, path)
+
 def train_supervised_learning(
-    data_path="data/expert_data.pkl",
+    data_path="data/expert_data",
     save_path="models/sl_policy.pth",
-    epochs=30,
-    batch_size=16,
-    lr=1e-3
+    epochs=15,
+    batch_size=512,
+    lr=2e-3,
+    num_workers=0
 ):
     print("启动监督学习阶段")
 
@@ -31,10 +37,18 @@ def train_supervised_learning(
     print(f"当前使用的计算设备: {device}\n")
 
     # 2. 加载数据集
+    resolved_data_path = resolve_project_path(data_path)
+    resolved_save_path = resolve_project_path(save_path)
+    print(f"训练数据路径: {resolved_data_path}")
+
     try:
-        dataloader = get_dataloader(data_path=data_path, batch_size=batch_size)
-    except FileNotFoundError:
-        print("错误：找不到数据集")
+        dataloader = get_dataloader(
+            data_path=resolved_data_path,
+            batch_size=batch_size,
+            num_workers=num_workers
+        )
+    except FileNotFoundError as exc:
+        print(f"错误：找不到数据集\n{exc}")
         return
 
     # 3. 初始化模型、损失函数和优化器
@@ -90,10 +104,10 @@ def train_supervised_learning(
         # 5. 保存表现最好的模型
         if avg_loss < best_loss:
             best_loss = avg_loss
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save(model.state_dict(), save_path)
+            os.makedirs(os.path.dirname(resolved_save_path), exist_ok=True)
+            torch.save(model.state_dict(), resolved_save_path)
             # 记录一句小提示，表明模型有进步
-            print(f"模型已进步，权重更新至 -> {save_path}")
+            print(f"模型已进步，权重更新至 -> {resolved_save_path}")
 
     print("\n监督学习训练完成")
 
