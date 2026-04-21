@@ -49,7 +49,7 @@ class SatelliteEnv:
 
     def reset(self):
         """ 重置环境，随机选择一个起始节点 """
-        self.time = 0
+        self.time = random.uniform(0, self.dynamics.orbital_period)
         self.total_delay = 0
         self._update_environment()
 
