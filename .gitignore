@@ -1,0 +1,20 @@
+# Ignore everything by default.
+*
+
+# Keep directory structure visible so allowlisted files can still be tracked.
+!*/
+
+# Always keep repository ignore rules.
+!.gitignore
+
+# Keep source code and documentation.
+!*.py
+!*.md
+
+# Keep experiment result figures.
+!*.png
+!*.jpg
+!*.jpeg
+!*.svg
+!*.pdf
+!*.gif
