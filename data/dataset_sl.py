@@ -1,127 +1,190 @@
+# data/dataset_sl.py
+
+from __future__ import annotations
+
 import json
-import os
 import pickle
 import random
 from bisect import bisect_right
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def resolve_data_path(data_path):
-    """优先解析到项目根目录，避免受当前启动目录影响。"""
-    if os.path.isabs(data_path):
-        return data_path
-
-    cwd_candidate = os.path.join(os.getcwd(), data_path)
-    root_candidate = os.path.join(PROJECT_ROOT, data_path)
-
-    if os.path.exists(cwd_candidate):
-        return cwd_candidate
-    if os.path.exists(root_candidate):
-        return root_candidate
-
-    return root_candidate
+from utils.paths import resolve_project_path
+from utils.seed import build_torch_generator, seed_worker
 
 
 class SatelliteExpertDataset(Dataset):
-    """卫星路由专家数据集，兼容单文件和分块目录两种格式。"""
+    """
+    Satellite routing expert dataset.
 
-    def __init__(self, data_path="data/expert_data"):
+    Supports two formats:
+
+    1. Legacy single-file pickle:
+        data/expert_data.pkl
+
+    2. Chunked directory:
+        outputs/datasets/expert_greedy_clean/
+          metadata.json
+          chunk_00000.pkl
+          chunk_00001.pkl
+          ...
+
+    Each sample is expected to be:
+        {
+            "state": {
+                "adjacency": np.ndarray,
+                "node_features": np.ndarray,
+                ...
+            },
+            "action": int
+        }
+    """
+
+    def __init__(self, data_path: str | Path):
         super().__init__()
 
-        resolved_path = resolve_data_path(data_path)
-        if not os.path.exists(resolved_path):
+        self.data_path = resolve_project_path(data_path)
+
+        if not self.data_path.exists():
             raise FileNotFoundError(
-                f"找不到数据集文件: {data_path} (解析后路径: {resolved_path})"
+                f"Dataset not found: {data_path} "
+                f"(resolved: {self.data_path})"
             )
 
-        self.data_path = resolved_path
-        self.data = None
-        self.chunk_paths = []
-        self.chunk_sizes = []
-        self.cumulative_sizes = []
-        self.is_chunked = False
-        self._cached_chunk_idx = None
-        self._cached_chunk_data = None
+        self.data: Optional[List[Dict[str, Any]]] = None
 
-        if os.path.isdir(self.data_path):
+        self.chunk_paths: List[Path] = []
+        self.chunk_sizes: List[int] = []
+        self.cumulative_sizes: List[int] = []
+        self.total_samples = 0
+        self.is_chunked = False
+
+        self._cached_chunk_idx: Optional[int] = None
+        self._cached_chunk_data: Optional[List[Dict[str, Any]]] = None
+
+        if self.data_path.is_dir():
             self.is_chunked = True
             self._init_chunked_dataset(self.data_path)
-            print(f"成功加载分块数据集，共 {self.total_samples} 条状态-动作对")
+            print(
+                f"Loaded chunked expert dataset: {self.data_path} | "
+                f"samples={self.total_samples} | chunks={len(self.chunk_paths)}"
+            )
         else:
             self._init_legacy_dataset(self.data_path)
-            print(f"成功加载单文件数据集，共 {len(self.data)} 条状态-动作对")
+            assert self.data is not None
+            print(
+                f"Loaded legacy expert dataset: {self.data_path} | "
+                f"samples={len(self.data)}"
+            )
 
-    def _init_legacy_dataset(self, data_path):
-        print(f"Loading legacy data from {data_path}...")
+    def _init_legacy_dataset(self, data_path: Path) -> None:
+        """
+        Load legacy single pickle dataset.
+        """
         with open(data_path, "rb") as f:
-            self.data = pickle.load(f)
+            data = pickle.load(f)
 
-    def _init_chunked_dataset(self, data_dir):
-        metadata_path = os.path.join(data_dir, "metadata.json")
-        metadata = None
+        if not isinstance(data, list):
+            raise TypeError(
+                f"Legacy dataset must be a list of samples, got: {type(data)}"
+            )
 
-        if os.path.exists(metadata_path):
-            print(f"Loading chunked data from {data_dir}...")
+        self.data = data
+        self.total_samples = len(data)
+
+    def _init_chunked_dataset(self, data_dir: Path) -> None:
+        """
+        Initialize chunked dataset metadata.
+        """
+        metadata_path = data_dir / "metadata.json"
+
+        if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as f:
                 metadata = json.load(f)
 
-        if metadata is not None:
             chunk_files = metadata.get("chunk_files", [])
-            self.chunk_sizes = metadata.get("chunk_sizes", [])
+            chunk_sizes = metadata.get("chunk_sizes", [])
         else:
             chunk_files = sorted(
-                file_name
-                for file_name in os.listdir(data_dir)
-                if file_name.startswith("chunk_") and file_name.endswith(".pkl")
+                path.name
+                for path in data_dir.iterdir()
+                if path.name.startswith("chunk_") and path.suffix == ".pkl"
             )
-            self.chunk_sizes = [None] * len(chunk_files)
+            chunk_sizes = [None] * len(chunk_files)
 
         if not chunk_files:
-            raise FileNotFoundError(f"在目录 {data_dir} 中没有找到任何 chunk 数据文件")
+            raise FileNotFoundError(
+                f"No chunk_*.pkl files found in dataset directory: {data_dir}"
+            )
 
-        self.chunk_paths = [os.path.join(data_dir, file_name) for file_name in chunk_files]
+        if len(chunk_files) != len(chunk_sizes):
+            raise ValueError(
+                "metadata.json has inconsistent chunk_files and chunk_sizes lengths"
+            )
 
-        if len(self.chunk_sizes) != len(self.chunk_paths):
-            raise ValueError("metadata.json 中的 chunk_files 与 chunk_sizes 数量不一致")
+        self.chunk_paths = [data_dir / file_name for file_name in chunk_files]
 
-        for idx, chunk_size in enumerate(self.chunk_sizes):
-            if chunk_size is None:
-                with open(self.chunk_paths[idx], "rb") as f:
-                    self.chunk_sizes[idx] = len(pickle.load(f))
+        self.chunk_sizes = []
+        for idx, chunk_path in enumerate(self.chunk_paths):
+            size = chunk_sizes[idx]
+
+            if size is None:
+                with open(chunk_path, "rb") as f:
+                    size = len(pickle.load(f))
+
+            self.chunk_sizes.append(int(size))
 
         total = 0
+        self.cumulative_sizes = []
+
         for chunk_size in self.chunk_sizes:
             total += chunk_size
             self.cumulative_sizes.append(total)
+
         self.total_samples = total
 
-    def _load_chunk(self, chunk_idx):
-        if self._cached_chunk_idx == chunk_idx and self._cached_chunk_data is not None:
+    def _load_chunk(self, chunk_idx: int) -> List[Dict[str, Any]]:
+        """
+        Load one chunk with one-chunk cache.
+        """
+        if (
+            self._cached_chunk_idx == chunk_idx
+            and self._cached_chunk_data is not None
+        ):
             return self._cached_chunk_data
 
         with open(self.chunk_paths[chunk_idx], "rb") as f:
-            self._cached_chunk_data = pickle.load(f)
-        self._cached_chunk_idx = chunk_idx
-        return self._cached_chunk_data
+            chunk_data = pickle.load(f)
 
-    def __len__(self):
-        if self.data is not None:
-            return len(self.data)
+        if not isinstance(chunk_data, list):
+            raise TypeError(
+                f"Chunk must be a list of samples: {self.chunk_paths[chunk_idx]}"
+            )
+
+        self._cached_chunk_idx = chunk_idx
+        self._cached_chunk_data = chunk_data
+
+        return chunk_data
+
+    def __len__(self) -> int:
         return self.total_samples
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
+        if idx < 0 or idx >= self.total_samples:
+            raise IndexError(f"Index out of range: {idx}")
+
         if self.data is not None:
             item = self.data[idx]
         else:
-            if idx < 0 or idx >= self.total_samples:
-                raise IndexError(f"索引越界: {idx}")
-
             chunk_idx = bisect_right(self.cumulative_sizes, idx)
-            chunk_start = 0 if chunk_idx == 0 else self.cumulative_sizes[chunk_idx - 1]
+            chunk_start = (
+                0
+                if chunk_idx == 0
+                else self.cumulative_sizes[chunk_idx - 1]
+            )
             chunk_data = self._load_chunk(chunk_idx)
             item = chunk_data[idx - chunk_start]
 
@@ -135,23 +198,43 @@ class SatelliteExpertDataset(Dataset):
         return adj, node_features, target
 
 
-class ChunkAwareBatchSampler(Sampler):
-    """按 chunk 采样，降低全局随机打乱时的跨文件读盘开销。"""
+class ChunkAwareBatchSampler(Sampler[List[int]]):
+    """
+    Batch sampler for chunked datasets.
 
-    def __init__(self, dataset, batch_size, shuffle=True, drop_last=False):
+    It shuffles chunk order first, then shuffles sample order inside each chunk.
+    This reduces frequent cross-file loading when using chunked pickle datasets.
+    """
+
+    def __init__(
+        self,
+        dataset: SatelliteExpertDataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        if not dataset.is_chunked:
+            raise ValueError("ChunkAwareBatchSampler requires a chunked dataset")
+
         self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
 
     def __iter__(self):
         chunk_indices = list(range(len(self.dataset.chunk_sizes)))
+
         if self.shuffle:
             random.shuffle(chunk_indices)
 
         for chunk_idx in chunk_indices:
             chunk_end = self.dataset.cumulative_sizes[chunk_idx]
-            chunk_start = 0 if chunk_idx == 0 else self.dataset.cumulative_sizes[chunk_idx - 1]
+            chunk_start = (
+                0
+                if chunk_idx == 0
+                else self.dataset.cumulative_sizes[chunk_idx - 1]
+            )
+
             indices = list(range(chunk_start, chunk_end))
 
             if self.shuffle:
@@ -159,37 +242,60 @@ class ChunkAwareBatchSampler(Sampler):
 
             for start in range(0, len(indices), self.batch_size):
                 batch = indices[start:start + self.batch_size]
+
                 if len(batch) < self.batch_size and self.drop_last:
                     continue
+
                 yield batch
 
-    def __len__(self):
+    def __len__(self) -> int:
         total_batches = 0
+
         for chunk_size in self.dataset.chunk_sizes:
             if self.drop_last:
                 total_batches += chunk_size // self.batch_size
             else:
                 total_batches += (chunk_size + self.batch_size - 1) // self.batch_size
+
         return total_batches
 
 
-def get_dataloader(data_path="data/expert_data", batch_size=32, shuffle=True, num_workers=0):
-    """获取训练用数据加载器。"""
+def get_dataloader(
+    data_path: str | Path,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    drop_last: bool = False,
+    seed: Optional[int] = None,
+) -> DataLoader:
+    """
+    Build DataLoader for expert dataset.
+    """
     dataset = SatelliteExpertDataset(data_path)
+
+    generator = build_torch_generator(seed)
 
     if dataset.is_chunked:
         batch_sampler = ChunkAwareBatchSampler(
-            dataset,
+            dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            drop_last=False,
+            drop_last=drop_last,
         )
-        return DataLoader(dataset, batch_sampler=batch_sampler, num_workers=num_workers)
+
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            worker_init_fn=seed_worker if seed is not None else None,
+        )
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        drop_last=False,
+        drop_last=drop_last,
+        generator=generator,
+        worker_init_fn=seed_worker if seed is not None else None,
     )
